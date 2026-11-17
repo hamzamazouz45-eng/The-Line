@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--fg:#e8eaed;--mut:#9aa0a6;--line:#2a2f38;--red:#ff5a5a;--grn:#3ad29f;--gry:#6b7280;--pur:#9a92ff}
+*{box-sizing:border-box}
+body{margin:0;background:transparent;color:var(--fg);font:13px/1.5 system-ui,sans-serif;padding:6px 10px 10px}
+#stats{display:flex;gap:14px;font-size:12px;color:var(--mut);justify-content:space-between}
+#stats b{color:var(--fg);font-weight:500}
+svg{width:100%;display:block;margin:4px 0}
+.flow{animation:flow 1.2s linear infinite}
+@keyframes flow{to{stroke-dashoffset:-16}}
+@media (prefers-reduced-motion:reduce){.flow{animation:none}}
+#chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.chip{border:0.5px solid var(--line);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--fg);background:transparent}
+.chip.on{background:#2a2f4a;border-color:var(--pur)}
+#card{border:0.5px solid var(--line);border-radius:10px;padding:8px 10px;margin-top:6px;min-height:64px}
+#card .d{direction:ltr;text-align:left;font-family:ui-monospace,monospace;font-size:12px;color:var(--fg);word-break:break-all}
+#card .m{color:var(--mut);font-size:12px}
+button.act{margin-top:6px;border:0.5px solid var(--line);background:transparent;color:var(--fg);border-radius:8px;padding:6px 12px;font-size:13px}
+button.act.cut{border-color:var(--red);color:var(--red)}
+#bar{display:flex;gap:8px;align-items:center;margin-top:8px}
+#clock{font-size:12px;color:var(--mut)}
+#note{font-size:12px;color:#ffb454;margin-top:4px;min-height:16px}
+</style>
+</head>
+<body>
+<div id="stats"><span>اتصالات <b id="s1">0</b></span><span>متتبّعات <b id="s2">0</b></span><span>تطبيقات <b id="s3">0</b></span></div>
+<svg id="map" viewBox="0 0 360 190" role="img" aria-label="خريطة اتصالات الهاتف"></svg>
+<div id="chips"></div>
+<div id="card"><span class="m">اضغط على أي خط لترى من أين جاء وتقطعه.</span></div>
+<div id="bar"><button class="act" id="rp">أعد آخر 8 ساعات</button><span id="clock"></span></div>
+<div id="note"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/topojson-client@3.1.0/dist/topojson-client.min.js"></script>
+<script>
+const A = window.Android || {
+  events: () => '[]', history: () => '[]', blocked: () => '[]',
+  setBlocked() {}, me: () => '36.75,3.06', geoReady: () => true
+};
+const W = 360, H = 190;
+const svg = d3.select('#map');
+const proj = d3.geoNaturalEarth1().fitSize([W, H], { type: 'Sphere' });
+const path = d3.geoPath(proj);
+const gL = svg.append('g'), gA = svg.append('g'), gD = svg.append('g');
+
+d3.json('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json').then(w => {
+  gL.append('path').datum(topojson.feature(w, w.objects.countries)).attr('d', path)
+    .attr('fill', '#1b2029').attr('stroke', '#2d3440').attr('stroke-width', .4);
+}).catch(() => note('تعذّر تحميل الخريطة. تحقق من الإنترنت.'));
+
+const [la, lo] = A.me().split(',').map(Number);
+const origin = [lo, la], op = proj(origin);
+gD.append('circle').attr('cx', op[0]).attr('cy', op[1]).attr('r', 4).attr('fill', '#9a92ff');
+function ring(x, y, c) {
+  gD.append('circle').attr('cx', x).attr('cy', y).attr('r', 3).attr('fill', 'none').attr('stroke', c).attr('stroke-width', 1.2)
+    .transition().duration(900).attr('r', 11).attr('opacity', 0).remove();
+}
+setInterval(() => ring(op[0], op[1], '#9a92ff'), 2600);
+
+let blocked = new Set(JSON.parse(A.blocked()));
+const arcs = new Map(), apps = new Map();
+let lastTs = 0, replay = false, sel = null, focusApp = null, tot = 0, trk = 0, unloc = 0;
+
+const isBlocked = d => { let s = d; for (;;) { if (blocked.has(s)) return true; const i = s.indexOf('.'); if (i < 0) return false; s = s.slice(i + 1); } };
+const $ = id => document.getElementById(id);
+function note(t) { $('note').textContent = t; }
+
+function paint(r) {
+  const e = r.ev, b = isBlocked(e.domain);
+  const col = b ? '#6b7280' : e.tracker ? '#ff5a5a' : '#3ad29f';
+  const w = Math.min(4, 1 + Math.log2(r.n + 1) * .7);
+  const dim = focusApp && focusApp !== e.app;
+  r.vis.attr('stroke', col).attr('stroke-width', w).attr('opacity', dim ? .12 : .9)
+    .attr('stroke-dasharray', b ? '4 4' : e.tracker ? '3 5' : null)
+    .classed('flow', !b && e.tracker);
+  r.dot.attr('fill', col).attr('opacity', dim ? .12 : 1);
+}
+
+function addEvent(e, anim) {
+  tot++; if (e.tracker) trk++;
+  const a = apps.get(e.app) || { n: 0, t: 0 };
+  a.n++; if (e.tracker) a.t++; apps.set(e.app, a);
+  if (e.lat == null) { unloc++; stats(); return; }
+  const key = e.app + '|' + e.domain;
+  let r = arcs.get(key);
+  if (!r) {
+    const d = path({ type: 'LineString', coordinates: [origin, [e.lon, e.lat]] });
+    const g = gA.append('g');
+    const vis = g.append('path').attr('d', d).attr('fill', 'none').attr('stroke-linecap', 'round');
+    g.append('path').attr('d', d).attr('fill', 'none').attr('stroke', 'transparent').attr('stroke-width', 14)
+      .style('cursor', 'pointer').on('click', () => select(key));
+    const p = proj([e.lon, e.lat]);
+    const dot = gD.append('circle').attr('cx', p[0]).attr('cy', p[1]).attr('r', 2.6);
+    r = { ev: e, n: 0, g, vis, dot, ready: !anim };
+    arcs.set(key, r);
+    r.n = 1; paint(r);
+    if (anim) {
+      const len = vis.node().getTotalLength();
+      vis.attr('stroke-dasharray', len).attr('stroke-dashoffset', len).classed('flow', false)
+        .transition().duration(800).attr('stroke-dashoffset', 0)
+        .on('end', () => { r.ready = true; vis.attr('stroke-dashoffset', 0); paint(r); ring(p[0], p[1], vis.attr('stroke')); });
+    }
+  } else {
+    r.n++; r.ev = e;
+    if (r.ready) paint(r);
+  }
+  stats(); chips(); if (sel === key) card();
+}
+
+function stats() {
+  $('s1').textContent = tot; $('s2').textContent = trk; $('s3').textContent = apps.size;
+  if (unloc && !A.geoReady()) note(unloc + ' اتصالًا بلا موقع. أضف GeoLite2-City.mmdb إلى assets.');
+}
+
+function chips() {
+  const list = [...apps.entries()].sort((a, b) => b[1].t - a[1].t || b[1].n - a[1].n).slice(0, 6);
+  const box = $('chips'); box.innerHTML = '';
+  const all = document.createElement('button');
+  all.className = 'chip' + (focusApp ? '' : ' on'); all.textContent = 'الكل';
+  all.onclick = () => { focusApp = null; arcs.forEach(r => r.ready && paint(r)); chips(); };
+  box.appendChild(all);
+  list.forEach(([name, a]) => {
+    const c = document.createElement('button');
+    c.className = 'chip' + (focusApp === name ? ' on' : '');
+    c.textContent = name + (a.t ? ' · ' + a.t + ' متتبّع' : '');
+    c.onclick = () => { focusApp = focusApp === name ? null : name; arcs.forEach(r => r.ready && paint(r)); chips(); };
+    box.appendChild(c);
+  });
+}
+
+function select(key) { sel = key; card(); }
+function card() {
+  const r = arcs.get(sel); if (!r) return;
+  const e = r.ev, b = isBlocked(e.domain);
+  const kind = b ? 'مقطوع' : e.tracker ? 'إعلانات أو تتبّع' : 'موقع عادي';
+  $('card').innerHTML = '';
+  const t = document.createElement('div'); t.textContent = e.app; t.style.fontWeight = 500;
+  const d = document.createElement('div'); d.className = 'd'; d.textContent = e.domain;
+  const m = document.createElement('div'); m.className = 'm';
+  m.textContent = kind + ' · ' + (e.city ? e.city + '، ' : '') + e.cc + ' · ' + r.n + ' مرة';
+  const btn = document.createElement('button'); btn.className = 'act' + (b ? '' : ' cut');
+  btn.textContent = b ? 'أعد السماح بهذا النطاق' : 'اقطع هذا الخط (يشمل كل التطبيقات)';
+  btn.onclick = () => {
+    A.setBlocked(e.domain, !b);
+    if (b) blocked.delete(e.domain); else blocked.add(e.domain);
+    arcs.forEach(x => x.ready && paint(x)); card();
+  };
+  $('card').append(t, d, m, btn);
+}
+
+function reset() {
+  gA.selectAll('*').remove(); gD.selectAll('circle').filter(function () { return this.getAttribute('r') === '2.6'; }).remove();
+  arcs.clear(); apps.clear(); tot = trk = unloc = 0; sel = null; stats(); chips();
+}
+
+function startReplay() {
+  const h = JSON.parse(A.history()).sort((a, b) => a.ts - b.ts);
+  if (!h.length) { note('لا توجد اتصالات مسجلة بعد.'); return; }
+  note(''); replay = true; reset();
+  const t0 = h[0].ts, t1 = Date.now(), dur = 20000, st = performance.now();
+  let i = 0;
+  (function step(now) {
+    const f = Math.min(1, (now - st) / dur), vt = t0 + (t1 - t0) * f;
+    while (i < h.length && h[i].ts <= vt) addEvent(h[i++], true);
+    $('clock').textContent = new Date(vt).toLocaleTimeString('ar', { hour: '2-digit', minute: '2-digit' });
+    if (f < 1) requestAnimationFrame(step);
+    else { lastTs = h[h.length - 1].ts; replay = false; $('clock').textContent = ''; }
+  })(st);
+}
+$('rp').onclick = () => { if (!replay) startReplay(); };
+
+JSON.parse(A.history()).forEach(e => { lastTs = Math.max(lastTs, e.ts); addEvent(e, false); });
+chips(); stats();
+if (!A.geoReady()) note('قاعدة المواقع غير موجودة. أضف GeoLite2-City.mmdb إلى assets.');
+setInterval(() => {
+  if (replay) return;
+  JSON.parse(A.events(lastTs)).forEach(e => { lastTs = Math.max(lastTs, e.ts); addEvent(e, true); });
+}, 1000);
+</script>
+</body>
+</html>
